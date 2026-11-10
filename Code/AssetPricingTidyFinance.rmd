@@ -1,0 +1,1796 @@
+# Reproducible Asset Pricing Tools using R
+
+Monthly data only here
+
+Based on Tidy Finance
+
+This is the manual one - find automatic/shortcut version of those tasks on Tidy Finance here [https://www.tidy-finance.org/chapters/accessing-and-managing-financial-data.ht](https://www.tidy-finance.org/chapters/accessing-and-managing-financial-data.html){.uri}[ml](https://www.tidy-finance.org/chapters/accessing-and-managing-financial-data.html)
+
+[**It also omit some the 'how to' to directly give malleable reproducible tools - very important to check in detail in Tidy Finance for instance that explains a lot too**]{.underline}
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+options(scipen = 999) # effectively disables scientific notation everywhere
+```
+
+```{r}
+# Libraries 
+
+library(tidyverse)  # dplyr, ggplot2, lubridate, readr, stringr, tidyr ...
+library(arrow) # read/write Parquet files; caches large WRDS pulls locally so you don't re-query the database every time you re-knit
+library(dbplyr) # to use dplyr on SQL
+library(RPostgres) # PostgreSQL driver — WRDS's database runs on PostgreSQL, this is what lets dbConnect() actually open the connection
+library(DBI) # to manage database
+library(scales) # percent(), comma(), dollar() formatting for readable ggplot axes and printed tables
+library(tidyfinance) # companion package to the Tidy Finance book; wraps WRDS pulls, Fama-French/macro data downloads, and CAPM/portfolio-sort helper functions
+```
+
+```{r}
+start_date <- ymd('1900-01-01') # buffer for safety
+# buffer recall: mktcap_lag (1 month), bm (~18 months - with 6-month lag + fill), rolling_capm (48–60 months), rolling SMB amd HML ?
+end_date <- ymd('2025-12-31')
+```
+
+```{r}
+# Cleaning environment 
+
+rm(list = setdiff(ls(), c("compustat_annual", "crsp_monthly", "factors_ff3_monthly")))
+```
+
+```{r}
+# Create a folder that will store our data
+
+if (!dir.exists("data-r")) { # check if the directory exsist
+  dir.create("data-r") # creates it
+}
+
+# Instead of .csv, use .parquet (faster, safer (csv can loose data when shared between language) etc...). Important to save our dataset instead of always recalling the API 'download_data'.
+```
+
+```{r}
+readRenviron("../config/.Renviron")
+```
+
+# ─────────────────
+
+# I/ Get Data
+
+## A) Diverse Financial Databases using Tidy Finance Shortcut
+
+### 1) Fama-French database
+
+FF3 model is used to **calculate the normal (expected)** return in event studies based on the Market premium, the Size premium and the Book-to-Market premium.
+
+1)  Rm-rf is the market's excess return (compensation for overall market risk)
+2)  SMB (**Small Minus Big**) is the return spread between **small-cap and large-cap** **portfolios** capturing the size premium **(small firms have historically earned higher average returns)**
+3)  HML (**High Minus Low**) is the return spread between **high and low book-to-market portfolios** capturing the value premium **(value stocks (high BtM) outperforming growth stocks)**
+
+Each row is a **month**, and each factor column (`mkt_excess`, `smb`, `hml`) is that month's **realized premium (**that month's value-weighted market return minus the risk-free rate, that month's small-portfolio return minus big-portfolio return (the realized size premium that month, that month's high-BM-portfolio return minus low-BM-portfolio return (the realized value premium that month).
+
+So a value like `smb = 0.0213` means small stocks beat big stocks by **2.13% that particular month**
+
+![](images/clipboard-758572383.png)
+
+**FF3 (and CAPM) have 3 main roles:**
+
+**Role 1 — Benchmark for abnormal returns (event studies, your CAR pipeline):**\
+
+FF3 generates the expected return; you subtract it from the realized return; the residual (AR) is your object of interest, attributed to the *event*. Here FF3's output feeds a **subtraction**.
+
+**Role 2 — Controls alongside a new variable (regressions):**\
+
+FF3 betas/factors sit on the right-hand side next to your candidate variable (key-man score, or in Fama-MacBeth: size, bm). The factors absorb known effects so the coefficient on *your* variable is clean. Here FF3's terms are **competing regressors**.
+
+And there's a **third classic role** worth adding to complete the picture:
+
+**Role 3 — The model itself as the thing being tested:**\
+
+Run FF3 on a portfolio or fund and look at **alpha**. If a fund manager claims skill, or someone claims a new anomaly, α ≠ 0 after FF3 says "there's return the model can't explain"; α = 0 says "your 'skill' was just size/value/market exposure." This is FF3 as judge rather than servant — performance evaluation and anomaly testing.
+
+It expends on the CAPM theory which lacks of the ability to explain several empirically documented return patterns using market risk (beta) alone.
+
+Using [Prof.Kenneth French’s finance data library](https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html) and TidyFinance shortcut:
+
+```{r}
+factors_ff3_monthly <- download_data(
+  domain = "famafrench",
+  dataset = "Fama/French 3 Factors",
+  start_date = start_date,
+  end_date = end_date
+)
+```
+
+```{r}
+write_parquet(factors_ff3_monthly, "data-r/factors_ff3_monthly.parquet")
+```
+
+All Fama-French datasets available from :
+
+```{r}
+list_supported_datasets(domain = "Fama-French")
+```
+
+### 2) Q-Factor database
+
+The **q-factor model** (Hou, Xue, and Zhang, 2015 and 2021 for fifth factor extension) is an alternative 5-factor **asset pricing model** grounded in **investment-based (q-theory) economics** rather than the Fama-French empirical/characteristics approach.
+
+1)  Rm-rf is the market's excess return (compensation for overall market risk)
+2)  ME (Size factor) is analogous to SMB; return spread between small and big firms
+3)  I/A (Investment factor) is the return spread between low-investment and high-investment firms (firms with low asset growth outperform firms with high asset growth)
+4)  ROE (Profitability factor) is the return spread between high and low return-on-equity (ROE) firms
+5)  EG (expected growth), this is the 5th factor from the **q⁵ model** (Hou, Xue, Zhang, extended 2021), which adds expected investment growth on top of the original q-factor model to better capture value-like patterns
+
+![](images/clipboard-942974780.png)
+
+Q-Factor <https://global-q.org/background.html>
+
+```{r}
+factors_q <- download_data(
+  domain = "Global Q",
+  dataset = "q5_factors_monthly_2024",
+  start_date = start_date,
+  end_date = end_date
+)
+```
+
+```{r}
+write_parquet(factors_q, "data-r/factors_q.parquet")
+```
+
+All Global Q dataset available:
+
+```{r}
+list_supported_datasets(domain = "Global Q")
+```
+
+### 3) Amit Goyal database (macroeconomic predictors)
+
+A set of macroeconomic and financial variables commonly used to predict the **equity risk premium** (i.e., forecast future stock market excess returns), hosted publicly on Amit Goyal's website and updated periodically.
+
+rp_div — Equity risk premium (market return minus risk-free rate) ; the variable being predicted
+
+dp — Dividend-price ratio (log): log(dividends) - log(price)
+
+dy — Dividend yield (log): log(dividends) - log(lagged price)
+
+ep — Earnings-price ratio (log): log(earnings) - log(price)
+
+de — Dividend-payout ratio (log): log(dividends) - log(earnings)
+
+svar — Stock variance: sum of squared daily market returns within the month
+
+bm — Book-to-market ratio for the aggregate market (DJIA book value / market value)
+
+ntis — Net equity expansion: 12-month moving sum of net equity issuance by NYSE stocks / total market
+
+cap tbl — Treasury bill rate (3-month T-bill secondary market rate)
+
+lty — Long-term government bond
+
+yield ltr — Long-term government bond return
+
+tms — Term spread = lty - tbl
+
+dfy — Default yield spread = BAA corporate bond yield - AAA corporate bond yield
+
+infl — Inflation rate (CPI, all urban consumers), typically lagged one month
+
+![](images/clipboard-861685376.png)
+
+```{r}
+macro_predictors <- download_data(
+  domain = "Goyal-Welch", # or macro_predictors
+  dataset = "monthly",
+  start_date = start_date,
+  end_date = end_date
+)
+```
+
+```{r}
+write_parquet(macro_predictors, "data-r/macro_predictors.parquet")
+```
+
+All macro predictors
+
+```{r}
+list_supported_datasets(domain = "Goyal-Welch")
+```
+
+But only until 2022. For more recent data, check on <https://sites.google.com/view/agoyal145> under [A Comprehensive 2022 Look at the Empirical Performance of Equity Premium Prediction](https://drive.google.com/file/d/11HdJIDvZtlhrZLTwHgVq1ocmhMpa_eTN/view?usp=sharing) in "Main publications" and download manually.
+
+### 4) FRED database (Federal Reserve Economic Data)
+
+FRED data <https://fred.stlouisfed.org/series/CPIAUCNS>
+
+```{r}
+fred <- download_data(
+  domain = "FRED",
+  series = "CPIAUCNS", # CPI for All Urban Consumers
+  start_date = start_date,
+  end_date = end_date
+)
+```
+
+```{r}
+write_parquet(fred, "data-r/fred.parquet")
+```
+
+To download other time series, we just have to look it up on the FRED website and extract the corresponding key from the address and replace the series. If your desired time series is not supported through `tidyfinance`, we recommend working with the `fredr` package.
+
+### 5) Other Tidy Finance Database Shortcut
+
+```{r}
+list_supported_types()
+```
+
+## B) WRDS
+
+```{r}
+wrds <- dbConnect(
+  Postgres(),
+  host = "wrds-pgdata.wharton.upenn.edu",
+  dbname = "wrds",
+  port = 9737,
+  sslmode = "require",
+  user = Sys.getenv("WRDS_USER"),
+  password = Sys.getenv("WRDS_PASSWORD")
+)
+
+# Don't forget to add a .Renviron file to store credentials locally only.
+```
+
+### 1) CRSP
+
+- Create **two lazy reference tables**
+
+```{r}
+# We need two tables
+
+# (i) CRSP monthly security file (price, column, return etc...) 
+
+msf_db <- tbl(wrds, I("crsp.msf_v2")) 
+
+# (ii) the identifying information (sharetype, exchange, trading status etc...)
+
+stksecurityinfohist_db <- tbl(wrds, I("crsp.stksecurityinfohist"))
+
+# create lazy references to the CRSP tables on WRDS (nothing is downloaded yet; tbl() just points R at the SQL table so you can chain filter()/select()/inner_join() before finally calling collect() to actually pull data)
+```
+
+- Select **parameters** (those are the Tidy Finance ones)
+
+```{r}
+crsp_monthly <- msf_db %>% 
+  filter(mthcaldt >= start_date & mthcaldt <= end_date) %>% 
+  select(-c(siccd, primaryexch, conditionaltype, tradingstatusflg)) %>% # because both tables have those overlapping columns, drop em.
+  inner_join(
+    stksecurityinfohist_db %>% 
+      filter(
+        sharetype == "NS" & # ordinary/standard share class, excludes special share structures
+          securitytype == "EQTY" & # security type equity 
+          securitysubtype == "COM" & #security sub type common stock
+          usincflg == "Y" & # US-incorporated only
+          issuertype %in% c("ACOR", "CORP") & # issuers that are a corporation 
+          primaryexch %in% c("N", "A", "Q") & # from NYSE, Amex, and NASDAQ
+          conditionaltype %in% c("RW", "NW") & # keeping only months where the stock was trading under normal conditions 
+          tradingstatusflg == "A" # actively traded stocks
+      ) %>% 
+      select(permno, secinfostartdt, secinfoenddt, primaryexch, siccd), # secinfostartdt = Security Info Start Date
+    join_by(permno)
+  ) %>% 
+  filter(mthcaldt >= secinfostartdt & mthcaldt <= secinfoenddt) %>% # keep only months within permno-specific start dates (*)
+  mutate(date = floor_date(mthcaldt, "month")) %>% # rounds a date down to the first day of its month
+  select(
+    permno, # Security identifier
+    date, # Month of the observation
+    ret = mthret, # Return
+    shrout, # Shares outstanding (in thousands)
+    prc = mthprc, # Last traded price in a month (use abs()?)
+    primaryexch, # Primary exchange code
+    siccd, # Industry code
+    vol = mthvol # Trading volume - not from Tidy Finance - I added it
+  ) %>% 
+  collect() %>% 
+  mutate(
+    shrout = shrout * 1000 # CRSP reports shrout in thousands of shares natively- use this to put actual units
+  )
+
+# * a single permno can have multiple rows in stksecurityinfohist_db over its lifetime, each with a different secinfostartdt/secinfoenddt window, because a company's exchange listing, share type, or trading status can change over time (e.g., moves from NASDAQ to NYSE, or changes share class). This line keeps only the rows where the return's date actually falls inside the validity window of that particular classification record — i.e., "was this specific classification (exchange, share type, trading status) true at the time this return was observed?" Say permno 12345 was listed on NASDAQ  from 1990-01 to 1995-06 and moved to NYSE later on. stksecurityinfohist_db would have two rows for this permno, each with its own secinfostartdt/secinfoenddt. After the inner_join, a monthly return from, say, 1993-03 would get matched to both rows (since the join is only on permno). Without this date filter, you'd end up with duplicate rows for that month — one correctly reflecting "NASDAQ" and one incorrectly reflecting "NYSE" (which wasn't true yet in 1993). The mthcaldt >= secinfostartdt & mthcaldt <= secinfoenddt filter discards the incorrect match, keeping only the row where the classification was actually valid on that date.
+
+# exclude price below $5?
+```
+
+- Create two mktcap variables (**mktcap, mktcap_lag**)
+
+- Transform primary **listing exchange codes to explicit exchange names**
+
+- Transform **industry codes to industry descriptions** (here following Bali et al. 2016 but can use FF 1997 too)
+
+```{r}
+# Adding mktcap variable
+
+crsp_monthly <- crsp_monthly %>% 
+  mutate(
+    mktcap = shrout * prc / 10^6, # mktcap = price * nb of share outstanding - check if none prc are negative - divide mktcap by one million to make the units in million
+    mktcap = na_if(mktcap, 0) # set zero market capitalization to missing as it makes conceptually little sense
+  )
+
+# Adding mktcap_lag variable
+
+mktcap_lag <- crsp_monthly %>% 
+  mutate(date = date %m+% months(1))  %>%  # use months(1) + join (not lag()) so a missing month produces a correct NA (sometimes jump in months in CRSP)
+  select(permno, date, mktcap_lag = mktcap)
+crsp_monthly <- crsp_monthly %>% 
+  left_join(mktcap_lag, join_by(permno, date))
+
+# Transform primary listing exchange codes to explicit exchange names
+
+crsp_monthly <- crsp_monthly %>% 
+  mutate(
+    exchange = case_when(
+      primaryexch == "N" ~ "NYSE",
+      primaryexch == "A" ~ "AMEX",
+      primaryexch == "Q" ~ "NASDAQ",
+      .default = "Other"
+    )
+  ) %>% 
+  select(-primaryexch)
+
+# Transform industry codes to industry descriptions (here following Bali et al. (2016))
+
+crsp_monthly <- crsp_monthly %>% 
+  mutate(
+    industry = case_when(
+      siccd >= 1 & siccd <= 999 ~ "Agriculture",
+      siccd >= 1000 & siccd <= 1499 ~ "Mining",
+      siccd >= 1500 & siccd <= 1799 ~ "Construction",
+      siccd >= 2000 & siccd <= 3999 ~ "Manufacturing",
+      siccd >= 4000 & siccd <= 4899 ~ "Transportation",
+      siccd >= 4900 & siccd <= 4999 ~ "Utilities",
+      siccd >= 5000 & siccd <= 5199 ~ "Wholesale",
+      siccd >= 5200 & siccd <= 5999 ~ "Retail",
+      siccd >= 6000 & siccd <= 6799 ~ "Finance",
+      siccd >= 7000 & siccd <= 8999 ~ "Services",
+      siccd >= 9000 & siccd <= 9999 ~ "Public",
+      .default = "Missing"
+    )
+  )
+```
+
+- Adding **excess return** (ret - rf (from ff3 database))
+
+```{r}
+ff3_rf <- read_parquet("data-r/factors_ff3_monthly.parquet") %>% 
+  select(date, risk_free)
+
+crsp_monthly <- crsp_monthly %>% 
+  left_join(ff3_rf, join_by(date)) %>% 
+  mutate(
+    ret_excess = ret - risk_free
+  ) %>% 
+  select(-risk_free)
+```
+
+- **Drop NAs**
+
+```{r}
+crsp_monthly <- crsp_monthly %>% 
+  drop_na(ret_excess, mktcap, mktcap_lag)
+```
+
+- **Write it** to save up some time (or don't and write instead **crsp_monthly_gvkey**)
+
+```{r}
+write_parquet(crsp_monthly, "data-r/crsp_monthly.parquet")
+```
+
+Works also for **daily price** (in a different way because way more rows) - <https://www.tidy-finance.org/r/wrds-crsp-and-compustat.html>
+
+### 2) Compustat
+
+Since info. mainly provided by 10-K, 10-Q etc..., unlike monthly CRPS, it's **annual data**
+
+- Create a **lazy reference**
+
+```{r}
+funda_db <- tbl(wrds, I("comp.funda"))
+```
+
+- Select **parameters** (those are the Tidy Finance ones)
+
+```{r}
+compustat_annual <- funda_db %>%
+  filter( # filter according the typical conventions
+    indfmt == "INDL" & # get only records in industrial data format, which includes companies that are primarily involved in manufacturing, services, and other non-financial business activities
+      datafmt == "STD" & # data in the standard format
+      consol == "C" & # restricts to consolidated financial statements only
+      curcd == "USD" & # in USD
+      datadate >= start_date &
+      datadate <= end_date  
+  ) %>%
+  select(
+    gvkey, # Firm identifier
+    datadate, # Date of the accounting data
+    seq, # Stockholders' equity
+    ceq, # Total common/ordinary equity
+    at, # Total assets
+    lt, # Total liabilities
+    txditc, # Deferred taxes and investment tax credit
+    txdb, # Deferred taxes
+    itcb, # Investment tax credit
+    pstkrv, # Preferred stock redemption value
+    pstkl, # Preferred stock liquidating value
+    pstk, # Preferred stock par value
+    capx, # Capital investment
+    oancf, # Operating cash flow
+    sale, # Revenue
+    cogs, # Costs of goods sold
+    xint, # Interest expense
+    xsga # Selling, general, and administrative expenses
+  ) %>%
+  collect()
+```
+
+- **Create variables** of book value of equity (**be**) and operating profitability (**op**) inspired by definitions in Ken French's data library
+
+```{r}
+compustat_annual <- compustat_annual %>%
+  mutate(
+    be = coalesce(seq, ceq + pstk, at - lt) + # coalesce returns the first non-missing value
+      coalesce(txditc, txdb + itcb, 0) -
+      coalesce(pstkrv, pstkl, pstk, 0),
+    op = (sale - coalesce(cogs, 0) - coalesce(xsga, 0) - coalesce(xint, 0)) /
+      be,
+  )
+```
+
+- **Keep only the last available information for each firm-year group** (occasionally Compustat has multiple rows for the same gvkey + fiscal year — for example, a company might restate its financials, or there might be a duplicate record from a data correction)
+
+```{r}
+compustat_annual <- compustat_annual %>%
+  mutate(year = year(datadate)) %>%
+  group_by(gvkey, year) %>%
+  filter(datadate == max(datadate)) %>%
+  ungroup()
+```
+
+- **Compute the investment ratio inv** (according to Ken French’s variable definitions) as the change in total assets from one fiscal year to another
+
+```{r}
+compustat_annual <- compustat_annual %>%
+  left_join(
+    compustat_annual %>%
+      select(gvkey, year, at_lag = at) %>%
+      mutate(year = year + 1),
+    join_by(gvkey, year)
+  ) %>%
+  mutate(
+    inv = at / at_lag - 1,
+    inv = if_else(at_lag <= 0, NA, inv)
+  )
+
+# not using lag() because  grabs "the previous row" within a gvkey group — it silently assumes the data is a clean, gapless sequence of consecutive fiscal years. But Compustat firm-year panels have gaps far more often than you might expect.
+```
+
+- **Write it** to save up some time
+
+```{r}
+write_parquet(compustat_annual, "data-r/compustat_annual.parquet")
+```
+
+### 3) Merging CRSP with Compustat
+
+Link PERMNO with GVKEY
+
+- Create a **lazy reference**
+
+```{r}
+ccm_linking_table_db <- tbl(wrds, I("crsp.ccmxpf_lnkhist"))
+```
+
+- Filter the **type**, **primary** **issuance** and **manage** '**still valid' date** that are NAs (Following Bali et al. (2016))
+
+- So it creates a table with **PERMNO - GVKEY - BEG VALID PERIOD - END VALID PERIOD**
+
+```{r}
+ccm_linking_table <- ccm_linking_table_db %>%
+  filter(
+    linktype %in% c("LU", "LC") & # restricts to the two "reliable" link types LU and LC
+      linkprim %in% c("P", "C") # restricts to links where the security is the firm's primary issue (P) or primary common share designated by CRSP (C).*
+  ) %>%
+  select(permno = lpermno, gvkey, linkdt, linkenddt) %>% # renames 'permno' for consistency and keeps linkdt/linkenddt — the validity window during which this permno-gvkey link was accurate (same secinfostartdt)
+  collect() %>%
+  mutate(linkenddt = replace_na(linkenddt, today())) #  for links that are still currently active, linkenddt is often stored as NA (meaning "still valid, no end date yet") rather than a far-future placeholder. This replaces those NAs with today's date, so that later date-range filtering (date >= linkdt & date <= linkenddt) works correctly for currently-active links instead of accidentally excluding them due to an NA comparison.
+
+#  * This matters because a single Compustat firm (gvkey) can have multiple listed securities (e.g., different share classes), and you only want to match to the one that represents the company's main traded stock otherwise you'd double-count or mismatch a firm's accounting data against the wrong security.
+```
+
+- Create a table with all **PERMNO-DATE** pairs and **add the GVKEY** **corresponding** to each pair
+
+```{r}
+ccm_links <- crsp_monthly %>%
+  inner_join(
+    ccm_linking_table,
+    join_by(permno),
+    relationship = "many-to-many" # do not show warning is merging *
+  ) %>%
+  filter(
+    !is.na(gvkey) & # drops any permno-months that have no corresponding Compustat firm at all 
+      (date >= linkdt & date <= linkenddt) #  keeps only the link record that was actually valid on that specific month, discarding matches from a different, non-overlapping link history episode for the same permno.
+  ) %>%
+  select(permno, gvkey, date)
+
+#* When you do inner_join(x, y, join_by(permno)), dplyr normally expects "one row in x matches at most one row in y" (one-to-one) or "one row in x matches many rows in y" (one-to-many). If your actual data doesn't fit that assumption, dplyr will throw a warning (not an error) telling you the join produced more rows than it expected, because both sides have multiple matching rows for the same key. It's not a filter and it doesn't change your results at all — it's purely a way of telling dplyr: "I know this join will produce multiple matches on both sides, I did this on purpose, don't warn me about it."
+```
+
+- **Add GVKEY** to **CRPS** database
+
+```{r}
+crsp_monthly_gvkey <- crsp_monthly %>% 
+  left_join(ccm_links, join_by(permno, date))
+```
+
+- **Drop if NA** (not from Tidy Finance - I added it)
+
+```{r}
+crsp_monthly_gvkey <- crsp_monthly_gvkey %>%
+  filter(!is.na(gvkey))
+```
+
+- **Write** **crsp_monthly_gvkey**
+
+```{r}
+write_parquet(crsp_monthly_gvkey, "data-r/crsp_monthly_gvkey.parquet")
+```
+
+- Don't merge CRSP and Compustat full because of lag accounting bias - that's why also keep the one year before. Remove it only at the very end.
+
+## C) Other Data Providers
+
+### 1) Bonds
+
+(<https://www.tidy-finance.org/r/trace-and-fisd.html>)
+
+- Bonds : TRACE and FISD
+
+### 2) Others
+
+(<https://www.tidy-finance.org/r/other-data-providers.html>)
+
+- Macro: FED, ECB
+- Financial data: Bloomberg, Refinitiv Eikon, NASDAQ Data Link, Simfin
+- High-frequency data: IEX, TAQ
+- Other: CoinMarketCap, CoinGecko, Twitter, SEC (EDGAR), Google Trends
+- **SEC API very powerful** (<https://sec-api.io/>)
+- **OpenAI API too** (<https://openai.com/fr-FR/codex/>)
+
+# ─────────────────
+
+# II/ Asset Pricing
+
+## A) CAPM
+
+According to the Capital Asset Pricing Model (CAPM) of Sharpe ([1964](https://www.tidy-finance.org/chapters/beta-estimation.html#ref-Sharpe1964)), Lintner ([1965](https://www.tidy-finance.org/chapters/beta-estimation.html#ref-Lintner1965)), and Mossin ([1966](https://www.tidy-finance.org/chapters/beta-estimation.html#ref-Mossin1966)), cross-sectional variation in expected asset returns should be a function of the covariance between the excess return of the asset and the excess return on the market portfolio. The regression coefficient of excess market returns on excess stock returns is usually called the market beta.
+
+### 1) Libraries and Model
+
+```{r}
+library(slider) # rolling/sliding window calculations over time series (rolling regressions, rolling means, etc.)
+library(nanoparquet)
+#library(furrr) # parallel versions of purrr's map() functions — runs the same operation across many stocks simultaneously, using multiple CPU cores
+```
+
+The estimation procedure is based on a rolling-window estimation, where we may use either **monthly** or **daily returns** and different window lengths. To estimate the CAPM regression coefficients, we regress stock excess returns `ret_excess` on excess returns of the market portfolio `mkt_excess`.
+
+![](images/clipboard-2146453621.png)
+
+### 2) Prepare the Dataset for the Market Beta Regression
+
+```{r}
+crsp_mkt_beta <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>% 
+  select(permno, date, industry, ret_excess) # keep industry for analytical purposes after the estimation
+
+ff3_mktexcess <- read_parquet("data-r/factors_ff3_monthly.parquet") %>% 
+  select(date, mkt_excess)
+
+mkt_beta_data <- crsp_mkt_beta %>% 
+  left_join(ff3_mktexcess, join_by(date))
+```
+
+### 3) Market Beta using Rolling-Window Estimation
+
+```{r}
+roll_capm_estimation <- function(data, look_back = 60, min_obs = 48) { #*  for each month you're estimating a beta at, look back 60 months (5 years) of that stock's return history to run the regression on, but only actually produce a beta if you have at least 48 valid observations in that window; otherwise return an empty tibble (skip) (no need to be consecutive months)
+  cumulants <- data %>%
+    summarize(
+      n = n(),
+      sum_x = sum(mkt_excess),
+      sum_y = sum(ret_excess),
+      sum_xx = sum(mkt_excess^2),
+      sum_yy = sum(ret_excess^2),
+      sum_xy = sum(mkt_excess * ret_excess),
+      .by = c(permno, date)
+    ) %>%
+    arrange(permno, date) %>%
+    mutate(
+      period = year(date) * 12 + month(date),
+      .by = permno
+    )
+
+  rolling_sums <- cumulants %>%
+    mutate(
+      across(
+        c(n, sum_x, sum_y, sum_xx, sum_yy, sum_xy),
+        \(col) slide_index_sum(col, period, before = look_back - 1)
+      ),
+      .by = permno
+    ) %>%
+    filter(n >= min_obs)
+
+  estimates <- rolling_sums %>%
+    mutate(
+      s_xx = sum_xx - sum_x^2 / n,
+      s_xy = sum_xy - sum_x * sum_y / n,
+      s_yy = sum_yy - sum_y^2 / n,
+      beta = s_xy / s_xx,
+      alpha = (sum_y - beta * sum_x) / n,
+      sigma2 = (s_yy - beta * s_xy) / (n - 2),
+      t_alpha = alpha / sqrt(sigma2 * (1 / n + (sum_x / n)^2 / s_xx)),
+      t_beta = beta / sqrt(sigma2 / s_xx)
+    )
+
+  bind_rows(
+    estimates %>%
+      transmute(
+        permno,
+        date,
+        coefficient = "alpha",
+        estimate = alpha,
+        t_statistic = t_alpha
+      ),
+    estimates %>%
+      transmute(
+        permno,
+        date,
+        coefficient = "mkt_excess",
+        estimate = beta,
+        t_statistic = t_beta
+      )
+  ) %>%
+    arrange(permno, date, coefficient) %>%
+    as_tibble()
+}
+
+# Standard convention: the 60-month / 48-obs pairing is directly from Fama-MacBeth (1973) and has been carried through as the standard rolling-CAPM window in empirical asset pricing ever since. Some papers use 36/24 (shorter, more responsive to recent conditions) or 120/60 (longer, more stable) — but 60/48 is the classic default.
+```
+
+```{r}
+capm_monthly <- roll_capm_estimation(mkt_beta_data)
+capm_monthly
+```
+
+- Write it
+
+```{r}
+write_parquet(capm_monthly, "data-r/capm_monthly.parquet")
+```
+
+### 4) Expected Returns (for event study)
+
+![](images/clipboard-4265857263.png)
+
+```{r}
+# keep only betas (remove alphas)
+mkt_beta <- read_parquet("data-r/capm_monthly.parquet") %>%
+  filter(coefficient == "mkt_excess") %>%
+  select(permno, date, beta = estimate)
+
+# Get risk-free and market excess return from FF3
+
+ff3 <- read_parquet("data-r/factors_ff3_monthly.parquet") %>%
+  select(date, risk_free, mkt_excess)
+```
+
+if you're building expected returns for an **event study / abnormal return** purpose, the standard convention is to use the **lagged beta** (estimated through month t−1, i.e., only information available *before* the month you're predicting). This avoids look-ahead bias — same principle as your `mktcap_lag` and 6-month `bm` lag: the expected return for month t should only use information knowable before t.
+
+```{r}
+expected_returns <- mkt_beta %>%
+  mutate(date = date %m+% months(1)) %>% # shift beta forward: month t's expected return uses beta estimated through t-1
+  left_join(ff3, join_by(date)) %>%
+  mutate(exp_ret = risk_free + beta * mkt_excess) %>%
+  select(permno, date, beta, exp_ret)
+```
+
+### 5) Abnormal Returns
+
+![](images/clipboard-2500618781.png)
+
+```{r}
+abnormal_returns <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>%
+  select(permno, date, ret) %>%
+  inner_join(expected_returns, join_by(permno, date)) %>%
+  mutate(ar = ret - exp_ret) # abnormal return = actual - expected
+```
+
+For Cumulative Abnormal Returns (CARs) - just `ar` summed over your event window per firm. Usually used over Daily Stock Price (use Eventus - <https://wrds-www.wharton.upenn.edu/pages/get-data/eventus/>)
+
+CAR formula (abnormal returns summed over the event window from t₁ to t₂):
+
+![](images/clipboard-2249727796.png)
+
+## B) Univariate Sorts and Monthly Premium (Size and BtM)
+
+In this chapter, we dive into portfolio sorts, one of the most widely used statistical methodologies in empirical asset pricing (e.g., [Bali et al. 2016](https://www.tidy-finance.org/chapters/univariate-portfolio-sorts.html#ref-BaliEngleMurray2016)). The key application of portfolio sorts is to examine whether one or more variables can predict future excess returns. In general, the idea is to sort individual stocks into portfolios, where the stocks within each portfolio are similar with respect to a sorting variable, such as firm size.
+
+### 1) Libraries and Data Preparation
+
+```{r}
+library(lmtest) # t-test and confidence intervals
+library(broom) # converts lm()'s output into a clean little table of coefficient 
+library(sandwich) # robust covariance matrix estimators
+library(furrr)
+library(rlang)
+```
+
+```{r}
+crsp_univariate <- read_parquet("data-r/crsp_monthly_gvkey.parquet")
+compustat_univariate <- read_parquet("data-r/compustat_annual.parquet")
+```
+
+### 2) Assign Portfolio Function
+
+Function to separate in different portfolios (2 or +) based on the data, a sorting variable, a number of portfolio and the exchange(s).
+
+```{r}
+assign_portfolio <- function(
+  data, # input 1
+  sorting_variable, # input 2
+  n_portfolios = NULL, # input 3: even splits (e.g. 2 -> median, 3 -> terciles); leave NULL if using percentiles
+  percentiles = NULL, # input 4: explicit cuts (e.g. c(0.5) or c(0.3, 0.7) FF convention); leave NULL if using n_portfolios
+  exchanges = NULL # input 5: optional - if NULL, use all exchanges (no filtering)
+) {
+  breakpoint_data <- data
+  if (!is.null(exchanges)) {
+    breakpoint_data <- breakpoint_data %>% 
+      filter(exchange %in% exchanges) # e.g. NYSE-only breakpoints, standard FF convention (size AND bm)
+  }
+
+  probs <- if (!is.null(percentiles)) {
+    c(0, percentiles, 1) # explicit cuts: add the two endpoints (0% and 100%) around your interior cut points
+  } else {
+    seq(0, 1, length.out = n_portfolios + 1) # even splits: rope logic - n pieces need n+1 marks
+  }
+
+  breakpoints <- breakpoint_data %>%
+    pull({{ sorting_variable }}) %>% # curly-curly: extracts the column you specified without hard-coding its name
+    quantile(
+      probs = probs,
+      na.rm = TRUE,
+      names = FALSE
+    )
+
+  assigned_portfolios <- data %>%
+    mutate(
+      portfolio = findInterval( # for each stock's value, finds which bucket between the breakpoints it falls into
+        pick(everything()) %>% pull({{ sorting_variable }}),
+        breakpoints,
+        all.inside = TRUE
+      )
+    ) %>%
+    pull(portfolio) # returns the portfolio-number column as a plain vector
+
+  assigned_portfolios
+}
+```
+
+### 3) Assign 'Small Size' vs 'Big Size' Portfolios Accross Whole Sample (!= monthly)
+
+- Based on mktcap_lag (variable already created)
+
+```{r}
+crsp_univariate <- crsp_univariate %>% 
+    filter(!is.na(mktcap_lag))
+
+size_sort <- assign_portfolio(crsp_univariate, sorting_variable = mktcap_lag, n_portfolios = 2, exchanges = c("NYSE", "NASDAQ", "AMEX")) # single vector function
+
+crsp_univariate_size_sorted <- crsp_univariate %>%
+  mutate(portfolio = size_sort) # attach vector back onto your data as a new column
+
+crsp_univariate_size_sorted <- crsp_univariate_size_sorted %>%
+  mutate(portfolio = factor(portfolio, levels = c(1, 2), labels = c("Small_Size", "Big_Size")))
+```
+
+### 4) Assign 'High Book-to-Market' vs 'Low Book-to-Market' Portfolios Accross Whole Sample (!= monthly)
+
+- Based on Book-to-market (be_lag(6m)/mktcap_lag(1m))
+
+- FF use 3 portfolios, low, medium and high
+
+  Variable needed: be_lag (6 months lagged), mktcap_lag (one month lagged) and thus bm (be_lag / mktcap_lag)
+
+  A fundamental problem in handling accounting data is the ***look-ahead bias*****;** we must not include data in forming a portfolio that is not public knowledge at the time. Of course, researchers have more information when looking into the past than agents had at that moment. However, abnormal excess returns from a trading strategy should not rely on an information advantage because the differential cannot be the result of informed agents’ trades. Hence, **we have to lag accounting information.** Book equity comes from **annual financial statements** (10-K filings), and there's a **real institutional delay** between a company's fiscal year-end and when that data is actually disclosed to the public (6 months)
+
+- **Create** the **variable**
+
+```{r}
+# Make be > 0 and fix date
+book_equity <- compustat_univariate %>% 
+  select(gvkey, datadate, be) %>%
+  filter(be > 0) %>% # best practice
+  drop_na() %>%
+  mutate(date = floor_date(ymd(datadate), "month")) # floor_date to set day = 1 - get only monthly data (instead of end on months)
+
+# Create bm (6 months shifted)
+bm_shifted <- book_equity %>%
+  inner_join(crsp_univariate, join_by(gvkey, date)) %>%
+  mutate(
+    bm = be / mktcap_lag, # using mktcap_lag instead of mktcap
+    sorting_date = date %m+% months(6),  # for bm lagged
+    accounting_date = sorting_date # for below use
+  ) %>%
+  select(permno, gvkey, sorting_date, accounting_date, bm)
+
+# Add bm to crps
+crsp_univariate_bm <- crsp_univariate %>%
+  left_join(bm_shifted, join_by(permno, gvkey, date == sorting_date)) %>% # join by sorting data (lagged one)
+  arrange(permno, gvkey, date) %>%
+  group_by(permno, gvkey) %>%
+  fill(bm, accounting_date) %>% # fill() looks at each NA and replaces it with the most recent non-NA value above it, within each firm group. So the table becomes - recall compustat is annual and crsp monthly
+  ungroup() %>%
+  filter(accounting_date > date %m-% months(12)) %>% # keep the row only if the accounting data is less than 12 months old; drops firms that stopped reporting and would otherwise keep using stale bm forever
+  select(-accounting_date) %>%
+  drop_na()
+```
+
+- Call **assign_function**, attach vector back onto the data as a new column
+
+```{r}
+crsp_univariate_bm <- crsp_univariate_bm %>% 
+  filter(!is.na(bm))
+
+bm_sort <- assign_portfolio(crsp_univariate_bm, sorting_variable = bm, n_portfolios = 3, exchanges = c("NYSE", "NASDAQ", "AMEX")) # single vector function
+
+crsp_univariate_bm_sorted <- crsp_univariate_bm %>%
+  mutate(portfolio = bm_sort) # attach vector back onto your data as a new column
+
+crsp_univariate_bm_sorted <- crsp_univariate_bm_sorted %>%
+  mutate(portfolio = factor(portfolio, levels = c(1, 2, 3), labels = c("Low_BtM", "Medium_BtM", "High_BtM")))
+```
+
+### 5) Return Function
+
+```{r}
+calculate_returns <- function(ret_excess, mktcap_lag, value_weighted) {
+  if (value_weighted) {
+    weighted.mean(ret_excess, mktcap_lag, na.rm = TRUE) # value weighted technique if value_weighted = TRUE, otherwise equally weighted
+  } else {
+    mean(ret_excess, na.rm = TRUE)
+  }
+}
+
+# Given a group of stocks (e.g., all stocks in "portfolio 3" in a given month (since monthly data)), this computes one representative return for that group.
+```
+
+### 6) SMB Monthly Premium
+
+```{r}
+compute_size_premium <- function(
+  n_portfolios = 2,
+  exchanges = c("NYSE", "NASDAQ", "AMEX"),
+  value_weighted = TRUE,
+  data = crsp_univariate,
+  monthly = FALSE # TRUE returns the full monthly series; FALSE returns the sample average
+) {
+  portfolio_returns <- data %>%
+    group_by(date) %>% # fresh breakpoints every month (essential - size distribution shifts over decades)
+    mutate(
+      portfolio = assign_portfolio(
+        data = pick(everything()),
+        sorting_variable = mktcap_lag,
+        n_portfolios = n_portfolios,
+        exchanges = exchanges
+      )
+    ) %>%
+    group_by(date, portfolio) %>%
+    summarize(
+      ret = calculate_returns(ret_excess, mktcap_lag, value_weighted),
+      .groups = "drop_last"
+    ) %>%
+    summarize(
+      size_premium = ret[portfolio == min(portfolio)] - # Small
+        ret[portfolio == max(portfolio)],                # Big
+      .groups = "drop"
+    )
+
+  if (monthly) {
+    portfolio_returns # one row per month: the monthly SMB-style series
+  } else {
+    portfolio_returns %>%
+      summarize(size_premium = mean(size_premium, na.rm = TRUE))
+  }
+}
+```
+
+```{r}
+smb_monthly <- compute_size_premium(data = crsp_univariate, monthly = TRUE)
+```
+
+### 7) HML Monthly Premium
+
+```{r}
+compute_value_premium <- function(
+  n_portfolios = 3,
+  exchanges = c("NYSE", "NASDAQ", "AMEX"),
+  value_weighted = TRUE,
+  data = crsp_univariate_bm,
+  monthly = FALSE
+) {
+  portfolio_returns <- data %>%
+    group_by(date) %>%
+    mutate(
+      portfolio = assign_portfolio(
+        data = pick(everything()),
+        sorting_variable = bm,
+        n_portfolios = n_portfolios,
+        exchanges = exchanges
+      )
+    ) %>%
+    group_by(date, portfolio) %>%
+    summarize(
+      ret = calculate_returns(ret_excess, mktcap_lag, value_weighted),
+      .groups = "drop_last"
+    ) %>%
+    summarize(
+      value_premium = ret[portfolio == max(portfolio)] - # High BtM (note: flipped vs size)
+        ret[portfolio == min(portfolio)],                 # Low BtM
+      .groups = "drop"
+    )
+
+  if (monthly) {
+    portfolio_returns
+  } else {
+    portfolio_returns %>%
+      summarize(value_premium = mean(value_premium, na.rm = TRUE))
+  }
+}
+```
+
+```{r}
+hml_monthly <- compute_value_premium(data = crsp_univariate_bm, monthly = TRUE)
+```
+
+## C) Bivariate Sorts and Monthly Premium (Size and BtM)
+
+### 1) Data Preparation
+
+```{r}
+factors_ff3_monthly <- download_data( # to check accuracy
+  domain = "famafrench",
+  dataset = "Fama/French 3 Factors",
+  start_date = start_date,
+  end_date = end_date
+)
+
+crsp_monthly_bivariate <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>% 
+  select(permno, gvkey, date, ret_excess, mktcap, mktcap_lag, exchange) %>% 
+  drop_na()
+```
+
+### 3) Create the Variables and the Dataset
+
+```{r}
+book_equity <- read_parquet("data-r/compustat_annual.parquet") %>% 
+  select(gvkey, datadate, be) %>% 
+  filter(be > 0) %>% 
+  drop_na() %>% 
+  mutate(date = floor_date(ymd(datadate), "month"))
+
+size_shifted <- crsp_monthly_bivariate %>% 
+  mutate(sorting_date = date %m+% months(1)) %>% 
+  select(permno, sorting_date, size = mktcap)
+
+bm_shifted <- book_equity %>% 
+  inner_join(crsp_monthly_bivariate, join_by(gvkey, date)) %>% 
+  mutate(
+    bm = be / mktcap,
+    sorting_date = date %m+% months(6),
+    accounting_date = sorting_date
+  ) %>% 
+  select(permno, gvkey, sorting_date, accounting_date, bm)
+```
+
+- Join bm and size from before
+
+```{r}
+
+bivariate_data <- crsp_monthly_bivariate %>%
+  left_join(bm_shifted, join_by(permno, gvkey, date == sorting_date)) %>%
+  left_join(size_shifted, join_by(permno, date == sorting_date)) %>%
+  select(permno, gvkey, date, ret_excess, mktcap_lag, size, bm, exchange, accounting_date) %>%
+  arrange(permno, gvkey, date) %>%
+  group_by(permno, gvkey) %>%
+  fill(bm, accounting_date) %>% # carry bm forward until next annual report
+  ungroup() %>%
+  filter(accounting_date > date %m-% months(12)) %>% # drop stale accounting data
+  select(-accounting_date) %>%
+  drop_na()
+```
+
+### 3) Independent vs Dependent Sort
+
+Bivariate sorts = sorting stocks on **two characteristics at the same time**, creating a grid of portfolios instead of a line. **Characteristics are correlated**. Small firms tend to have higher book-to-market; value firms tend to be smaller. So when your univariate BM sort shows high-BM stocks outperforming, a skeptic asks: *is that a value effect, or just the size effect wearing a costume?* A univariate sort can't answer — its "High BM" bucket is contaminated with smallness. Bivariate sorts are the fix: examine one variable **while holding the other one fixed**.
+
+The mechanics — a 2×3 size × BM sort
+
+1)  Sort on size → Small / Big
+
+2)  Sort on BM → Low / Medium / High
+
+- Independent: BM breakpoints on the FULL universe (blind to step 1)
+
+- Dependent: BM breakpoints WITHIN each size group (cells created directly here)
+
+3)  Intersect → every stock lands in exactly one of 6 cells (Independent only. Dependent: no step — step 2 already placed everyone.)
+
+![](images/clipboard-992846729.png)
+
+4)  Compute each cell's (value-weighted) monthly return
+
+HML_t = avg(S/H_t, B/H_t) − avg(S/L_t, B/L_t)
+
+SMB_t = avg(S/L_t S/M_t, S/H_t) − avg(B/L_t, B/M_t, B/H_t)
+
+### 4) Independent Sorts and Monthly Premium (Size and BtM)
+
+```{r}
+# 1) Assign both dimensions each month (independent sort: both breakpoints on the full cross-section)
+portfolios_2x3_indep <- bivariate_data %>%
+  group_by(date) %>%
+  mutate(
+    portfolio_size = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = size,
+      n_portfolios = 2, # Small / Big (median)
+      exchanges = c("NYSE")
+    ),
+    portfolio_bm = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = bm,
+      n_portfolios = 3, # Low / Medium / High
+      exchanges = c("NYSE")
+    )
+  ) %>%
+# 2) Intersect (independent sort) -> 6 cells, compute each cell's value-weighted monthly return
+  group_by(date, portfolio_bm, portfolio_size) %>% 
+  summarize(
+    ret = weighted.mean(ret_excess, mktcap_lag),
+    .groups = "drop"
+  )
+# 3) Build the monthly factors from the 6 cells
+factors_replicated_indep <- portfolios_2x3_indep %>%
+  group_by(date) %>%
+  summarize(
+    # HML_t = avg(S/H_t, B/H_t) - avg(S/L_t, B/L_t)   (medium column unused)
+    hml_replicated = mean(ret[portfolio_bm == 3]) - mean(ret[portfolio_bm == 1]),
+    # SMB_t = avg(S/L_t, S/M_t, S/H_t) - avg(B/L_t, B/M_t, B/H_t)
+    smb_replicated = mean(ret[portfolio_size == 1]) - mean(ret[portfolio_size == 2])
+  )
+```
+
+### 5) Compare with Actual Premiums (independent)
+
+```{r}
+comparison <- factors_ff3_monthly %>%
+  select(date, smb, hml) %>%
+  inner_join(factors_replicated_indep, join_by(date))
+
+comparison %>%
+  summarise(
+    cor_smb = cor(smb, smb_replicated),
+    cor_hml = cor(hml, hml_replicated),
+    mean_smb_official = mean(smb), mean_smb_yours = mean(smb_replicated),
+    mean_hml_official = mean(hml), mean_hml_yours = mean(hml_replicated)
+  )
+```
+
+### 6) Dependent Sorts and Monthly Premium (Size and BtM)
+
+```{r}
+portfolios_2x3_dep <- bivariate_data %>%
+  group_by(date) %>%
+  mutate(
+    portfolio_size = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = size,
+      n_portfolios = 2,
+      exchanges = c("NYSE")
+    )
+  ) %>%
+  group_by(date, portfolio_size) %>%  # <- THE difference between independent sort and dependent sort: regroup before the second sort
+  mutate(
+    portfolio_bm = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = bm,
+      n_portfolios = 3,
+      exchanges = c("NYSE")
+    )
+  ) %>%
+  group_by(date, portfolio_size, portfolio_bm) %>%
+  summarize(
+    ret = weighted.mean(ret_excess, mktcap_lag),
+    .groups = "drop"
+  )
+
+factors_replicated_dep <- portfolios_2x3_dep %>%
+  group_by(date) %>%
+  summarize(
+    # HML_t (conditional) = avg(S/H_t, B/H_t) - avg(S/L_t, B/L_t)
+    hml_dep = mean(ret[portfolio_bm == 3]) - mean(ret[portfolio_bm == 1]),
+    # SMB_t (conditional) = avg(S/L_t, S/M_t, S/H_t) - avg(B/L_t, B/M_t, B/H_t)
+    smb_dep = mean(ret[portfolio_size == 1]) - mean(ret[portfolio_size == 2])
+  )
+
+```
+
+### 7) Compare with Actual Premiums (dependent)
+
+```{r}
+comparison <- factors_ff3_monthly %>%
+  select(date, smb, hml) %>%
+  inner_join(factors_replicated_dep, join_by(date))
+
+comparison %>%
+  summarise(
+    cor_smb = cor(smb, smb_dep),
+    cor_hml = cor(hml, hml_dep),
+    mean_smb_official = mean(smb), mean_smb_yours = mean(smb_dep),
+    mean_hml_official = mean(hml), mean_hml_yours = mean(hml_dep)
+  )
+```
+
+A little smaller than independent - that's normla FF3 use independent sorting :)
+
+## D) Replicating Fama-French Three Factors Premium
+
+- Like C) but with some more precise parameters
+
+### 1) Data Preparation
+
+```{r}
+crsp_monthly_replication_3 <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>% 
+  select(permno, gvkey,date,ret_excess,mktcap,mktcap_lag,exchange)
+
+compustat_annual_replication_3  <- read_parquet("data-r/compustat_annual.parquet")  %>% 
+  select(gvkey, datadate, be)  %>% 
+  filter(be > 0)
+
+factors_ff3_monthly <- download_data( # to compare
+  domain = "famafrench",
+  dataset = "Fama/French 3 Factors",
+  start_date = start_date,
+  end_date = end_date
+)
+```
+
+First, Fama and French **form their portfolios in June of year t**, whereby the returns of July are the first monthly return for the respective portfolio. For firm size, they consequently use the market capitalization recorded for June. It is then held constant until June of year t+1.
+
+Second, Fama and French also have a different protocol for computing the book-to-market ratio. **They use market equity as of the end of year t-1 and the book equity reported in year, i.e., the datadate is within the last year**. Hence, the book-to-market ratio can be based on accounting information that is up to 18 months old. Market equity also does not necessarily reflect the same time point as book equity. The other sorting variables are analogously to book equity taken from year t-1.
+
+### 2) Create the Variables and the Dataset
+
+```{r}
+size <- crsp_monthly_replication_3 %>%
+  filter(month(date) == 6) %>%
+  mutate(sorting_date = date %m+% months(1)) %>%
+  select(permno, exchange, sorting_date, size = mktcap)
+
+market_equity <- crsp_monthly_replication_3 %>%
+  filter(month(date) == 12) %>%
+  mutate(sorting_date = ymd(str_c(year(date) + 1, "0701"))) %>%
+  select(permno, gvkey, sorting_date, me = mktcap)
+
+book_to_market <- compustat_annual_replication_3 %>%
+  mutate(sorting_date = ymd(str_c(year(datadate) + 1, "0701"))) %>%
+  select(gvkey, sorting_date, be) %>%
+  inner_join(market_equity, join_by(gvkey, sorting_date)) %>%
+  mutate(bm = be / me) %>%
+  select(permno, sorting_date, me, bm)
+
+sorting_variables_replication_3 <- size %>%
+  inner_join(
+    book_to_market,
+    join_by(permno, sorting_date)
+  ) %>%
+  drop_na() %>%
+  distinct(permno, sorting_date, .keep_all = TRUE)
+```
+
+### 3) Portfolio Independent Sort (using assign_portfolio)
+
+Fama and French rely on NYSE-specific breakpoints to **independently** form two portfolios in the size dimension at the median
+
+And three portfolios in the dimension of book-to-market at the 30- and 70-percentiles (also NYSE only)
+
+```{r}
+portfolios_replication_3 <- sorting_variables %>%
+  group_by(sorting_date) %>%
+  mutate(
+    portfolio_size = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = size,
+      percentiles = c(0.5),
+      exchanges = "NYSE",
+    ),
+    portfolio_bm = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = bm,
+      percentiles = c(0.3, 0.7),
+      exchanges = "NYSE",
+    )
+  ) %>%
+  ungroup() %>%
+  select(permno, sorting_date, portfolio_size, portfolio_bm)
+```
+
+### 4) Merge the Portfolios to the Data for the Rest of the Year
+
+```{r}
+portfolios_replication_3 <- crsp_monthly_replication_3 %>%
+  mutate(
+    sorting_date = case_when(
+      month(date) <= 6 ~ ymd(str_c(year(date) - 1, "0701")),
+      month(date) >= 7 ~ ymd(str_c(year(date), "0701"))
+    )
+  ) %>%
+  inner_join(portfolios_replication_3, join_by(permno, sorting_date))
+```
+
+### 5) Compute the Value-Weighted Average Return for Each of the Six Portfolios
+
+```{r}
+factors_replicated_3 <- portfolios_replication_3 %>%
+  group_by(portfolio_size, portfolio_bm, date) %>%
+  summarize(
+    ret = weighted.mean(ret_excess, mktcap_lag),
+    .groups = "drop"
+  ) %>%
+  group_by(date) %>%
+  summarize(
+    smb_replicated_3 = mean(ret[portfolio_size == 1]) -
+      mean(ret[portfolio_size == 2]),
+    hml_replicated_3 = mean(ret[portfolio_bm == 3]) -
+      mean(ret[portfolio_bm == 1])
+  )
+```
+
+### 6) Compare with Actual FF3 Premiums
+
+```{r}
+comparison <- factors_ff3_monthly %>%
+  select(date, smb, hml) %>%
+  inner_join(factors_replicated_3, join_by(date))
+
+comparison %>%
+  summarise(
+    cor_smb = cor(smb, smb_replicated_3),
+    cor_hml = cor(hml, hml_replicated_3),
+    mean_smb_official = mean(smb), mean_smb_yours = mean(smb_replicated_3),
+    mean_hml_official = mean(hml), mean_hml_yours = mean(hml_replicated_3)
+  )
+```
+
+Very good results!
+
+## E) Replicating Fama-French Five Factors Premium
+
+### 1) Data Preparation
+
+```{r}
+crsp_monthly_replication_5 <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>% 
+  select(permno, gvkey,date,ret_excess,mktcap,mktcap_lag,exchange)
+
+compustat_annual_replication_5  <- read_parquet("data-r/compustat_annual.parquet")  %>% 
+  select(gvkey, datadate, be, op, inv)  %>% 
+  filter(be > 0)
+
+factors_ff5_monthly <- download_data( # to compare
+  domain = "famafrench",
+  dataset = "factors_ff_5_2x3_monthly",
+  start_date = start_date,
+  end_date = end_date
+)
+```
+
+### 2) Create the Variables and the Dataset
+
+```{r}
+# Recompute the first 2 variables
+size <- crsp_monthly_replication_5 %>%
+  filter(month(date) == 6) %>%
+  mutate(sorting_date = date %m+% months(1)) %>%
+  select(permno, exchange, sorting_date, size = mktcap)
+
+market_equity <- crsp_monthly_replication_5 %>%
+  filter(month(date) == 12) %>%
+  mutate(sorting_date = ymd(str_c(year(date) + 1, "0701"))) %>%
+  select(permno, gvkey, sorting_date, me = mktcap)
+
+# Compute the two more (+bm)
+
+other_sorting_variables <- compustat_annual_replication_5 %>%
+  mutate(sorting_date = ymd(str_c(year(datadate) + 1, "0701"))) %>%
+  select(gvkey, sorting_date, be, op, inv) %>%
+  inner_join(market_equity, join_by(gvkey, sorting_date)) %>%
+  mutate(bm = be / me) %>%
+  select(permno, sorting_date, me, be, bm, op, inv)
+
+sorting_variables_replication_5 <- size %>%
+  inner_join(
+    other_sorting_variables,
+    join_by(permno, sorting_date)
+  ) %>%
+  drop_na() %>%
+  distinct(permno, sorting_date, .keep_all = TRUE)
+```
+
+### 3) Portfolio Independent and Dependent Sorts (using assign_portfolio)
+
+In each month, we independently sort all stocks into the two size portfolios. The value, profitability, and investment portfolios, on the other hand, are the results of dependent sorts based on the size portfolios. We then merge the portfolios to the return data for the rest of the year just as above.
+
+```{r}
+portfolios <- sorting_variables_replication_5 %>%
+  group_by(sorting_date) %>%
+  mutate(
+    portfolio_size = assign_portfolio(
+      data = pick(everything()),
+      sorting_variable = "size",
+      percentiles = c(0.5),
+      exchanges = "NYSE"
+    )
+  ) %>%
+  group_by(sorting_date, portfolio_size) %>%
+  mutate(
+    across(
+      c(bm, op, inv),
+      ~ assign_portfolio(
+        data = pick(everything()),
+        sorting_variable = .,
+        percentiles = c(0.3, 0.7),
+        exchanges = "NYSE"
+      ),
+      .names = "portfolio_{.col}"
+    )
+  ) %>%
+  ungroup() %>%
+  select(
+    permno,
+    sorting_date,
+    portfolio_size,
+    portfolio_bm,
+    portfolio_op,
+    portfolio_inv
+  )
+
+portfolios_replication_5 <- crsp_monthly_replication_5 %>%
+  mutate(
+    sorting_date = case_when(
+      month(date) <= 6 ~ ymd(str_c(year(date) - 1, "0701")),
+      month(date) >= 7 ~ ymd(str_c(year(date), "0701"))
+    )
+  ) %>%
+  inner_join(portfolios, join_by(permno, sorting_date))
+```
+
+### 4) Create All Factors and Calculate Premiums
+
+Now, we want to construct each of the factors, but this time the size factor actually comes last because it is the result of averaging across all other factor portfolios. This dependency is the reason why we keep the table with value-weighted portfolio returns as a separate object that we reuse later. We construct the value factor, HML, as above by going long the two portfolios with high book-to-market ratios and shorting the two portfolios with low book-to-market.
+
+- Monthly Value Premium (HML)
+
+Going long the two portfolios with high book-to-market ratios and shorting the two portfolios with low book-to-market.
+
+```{r}
+portfolios_value_5 <- portfolios_replication_5 %>%
+  group_by(portfolio_size, portfolio_bm, date) %>%
+  summarize(
+    ret = weighted.mean(ret_excess, mktcap_lag),
+    .groups = "drop"
+  )
+
+factors_value_5 <- portfolios_value_5 %>%
+  group_by(date) %>%
+  summarize(
+    hml_replicated_5 = mean(ret[portfolio_bm == 3]) -
+      mean(ret[portfolio_bm == 1])
+  )
+```
+
+- Monthly Profitability Premium (RMW)
+
+Take a long position in the two high profitability portfolios and a short position in the two low profitability portfolios.
+
+```{r}
+portfolios_profitability_5 <- portfolios_replication_5 %>%
+  group_by(portfolio_size, portfolio_op, date) %>%
+  summarize(
+    ret = weighted.mean(ret_excess, mktcap_lag),
+    .groups = "drop"
+  )
+
+factors_profitability_5 <- portfolios_profitability_5 %>%
+  group_by(date) %>%
+  summarize(
+    rmw_replicated_5 = mean(ret[portfolio_op == 3]) -
+      mean(ret[portfolio_op == 1])
+  )
+```
+
+- Monthly Investment Premium (CMA)
+
+We go long the two low investment portfolios and short the two high investment portfolios.
+
+```{r}
+portfolios_investment_5 <- portfolios_replication_5 %>%
+  group_by(portfolio_size, portfolio_inv, date) %>%
+  summarize(
+    ret = weighted.mean(ret_excess, mktcap_lag),
+    .groups = "drop"
+  )
+
+factors_investment_5 <- portfolios_investment_5 %>%
+  group_by(date) %>%
+  summarize(
+    cma_replicated_5 = mean(ret[portfolio_inv == 1]) -
+      mean(ret[portfolio_inv == 3])
+  )
+```
+
+- Monthly Size Premium (SMB)
+
+Going long the nine small portfolios and short the nine large portfolios.
+
+```{r}
+factors_size_5 <- bind_rows(
+  portfolios_value_5,
+  portfolios_profitability_5,
+  portfolios_investment_5
+) %>%
+  group_by(date) %>%
+  summarize(
+    smb_replicated_5 = mean(ret[portfolio_size == 1]) -
+      mean(ret[portfolio_size == 2])
+  )
+```
+
+### 5) Merge Them
+
+```{r}
+factors_replicated_5 <- factors_size_5 %>%
+  full_join(factors_value_5, join_by(date)) %>%
+  full_join(factors_profitability_5, join_by(date)) %>%
+  full_join(factors_investment_5, join_by(date))
+```
+
+### 6) Compare with Actual FF5 Premiums
+
+```{r}
+comparison <- factors_ff5_monthly %>%
+  select(date, smb, hml,rmw,cma) %>%
+  inner_join(factors_replicated_5, join_by(date))
+
+comparison %>%
+  summarise(
+    # correlations - the machinery check
+    cor_smb = cor(smb, smb_replicated_5, use = "complete.obs"),
+    cor_hml = cor(hml, hml_replicated_5, use = "complete.obs"),
+    cor_rmw = cor(rmw, rmw_replicated_5, use = "complete.obs"),
+    cor_cma = cor(cma, cma_replicated_5, use = "complete.obs"),
+    # means - the premium-level check
+    mean_smb_official = mean(smb), mean_smb_yours = mean(smb_replicated_5),
+    mean_hml_official = mean(hml), mean_hml_yours = mean(hml_replicated_5),
+    mean_rmw_official = mean(rmw), mean_rmw_yours = mean(rmw_replicated_5),
+    mean_cma_official = mean(cma), mean_cma_yours = mean(cma_replicated_5))
+```
+
+All great!!
+
+## F) Fama-French Three-Factor Model
+
+### 1) Libraries and Model
+
+```{r}
+library(slider) # rolling/sliding window calculations over time series (rolling regressions, rolling means, etc.)
+library(nanoparquet)
+```
+
+![](images/clipboard-1229676446.png)
+
+### 2) Prepare the Dataset for the Market, Size and B/M Betas Regressions
+
+```{r}
+crsp_ff3_beta <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>% 
+  select(permno, date, industry, ret_excess) # keep industry for analytical purposes after the estimation
+
+factors_ff3_beta <- read_parquet("data-r/factors_ff3_monthly.parquet") %>% 
+    select(date, mkt_excess, smb, hml)
+
+ff3_betas_data <- crsp_ff3_beta %>% 
+  left_join(factors_ff3_beta, join_by(date))
+```
+
+### 3) Market, Size and B/M Betas using Rolling-Window Estimation
+
+```{r}
+roll_ff3_estimation <- function(data, look_back = 60, min_obs = 48) {
+  # x1 = mkt_excess, x2 = smb, x3 = hml, y = ret_excess
+
+  cumulants <- data %>%
+    summarize(
+      n = n(),
+      sum_x1 = sum(mkt_excess), sum_x2 = sum(smb), sum_x3 = sum(hml),
+      sum_y = sum(ret_excess),
+      sum_x1x1 = sum(mkt_excess^2), sum_x2x2 = sum(smb^2), sum_x3x3 = sum(hml^2),
+      sum_x1x2 = sum(mkt_excess * smb),
+      sum_x1x3 = sum(mkt_excess * hml),
+      sum_x2x3 = sum(smb * hml),
+      sum_x1y = sum(mkt_excess * ret_excess),
+      sum_x2y = sum(smb * ret_excess),
+      sum_x3y = sum(hml * ret_excess),
+      sum_yy = sum(ret_excess^2),
+      .by = c(permno, date)
+    ) %>%
+    arrange(permno, date) %>%
+    mutate(period = year(date) * 12 + month(date), .by = permno)
+
+  rolling_sums <- cumulants %>%
+    mutate(
+      across(
+        c(n, starts_with("sum_")),
+        \(col) slide_index_sum(col, period, before = look_back - 1)
+      ),
+      .by = permno
+    ) %>%
+    filter(n >= min_obs)
+
+  estimates <- rolling_sums %>%
+    mutate(
+      # centered (demeaned) cross-products: s_jk = Σxjxk − Σxj·Σxk/n
+      s11 = sum_x1x1 - sum_x1^2 / n,
+      s22 = sum_x2x2 - sum_x2^2 / n,
+      s33 = sum_x3x3 - sum_x3^2 / n,
+      s12 = sum_x1x2 - sum_x1 * sum_x2 / n,
+      s13 = sum_x1x3 - sum_x1 * sum_x3 / n,
+      s23 = sum_x2x3 - sum_x2 * sum_x3 / n,
+      s1y = sum_x1y - sum_x1 * sum_y / n,
+      s2y = sum_x2y - sum_x2 * sum_y / n,
+      s3y = sum_x3y - sum_x3 * sum_y / n,
+      syy = sum_yy - sum_y^2 / n,
+
+      # cofactors of the symmetric 3x3 matrix S (for Cramer's rule / inverse)
+      adj11 = s22 * s33 - s23^2,
+      adj12 = s13 * s23 - s12 * s33,
+      adj13 = s12 * s23 - s13 * s22,
+      adj22 = s11 * s33 - s13^2,
+      adj23 = s12 * s13 - s11 * s23,
+      adj33 = s11 * s22 - s12^2,
+      det = s11 * adj11 + s12 * adj12 + s13 * adj13,
+
+      # betas: b = S^{-1} s_y
+      beta_mkt = (adj11 * s1y + adj12 * s2y + adj13 * s3y) / det,
+      beta_smb = (adj12 * s1y + adj22 * s2y + adj23 * s3y) / det,
+      beta_hml = (adj13 * s1y + adj23 * s2y + adj33 * s3y) / det,
+
+      # alpha from the means
+      alpha = (sum_y - beta_mkt * sum_x1 - beta_smb * sum_x2 - beta_hml * sum_x3) / n,
+
+      # residual variance: SSR/(n − 4) (4 estimated params: alpha + 3 betas)
+      sigma2 = (syy - beta_mkt * s1y - beta_smb * s2y - beta_hml * s3y) / (n - 4),
+
+      # standard errors: var(b_j) = sigma2 * [S^{-1}]_jj
+      t_mkt = beta_mkt / sqrt(sigma2 * adj11 / det),
+      t_smb = beta_smb / sqrt(sigma2 * adj22 / det),
+      t_hml = beta_hml / sqrt(sigma2 * adj33 / det),
+
+      # t of alpha: var(alpha) = sigma2 * (1/n + m' S^{-1} m), m = vector of regressor means
+      m1 = sum_x1 / n, m2 = sum_x2 / n, m3 = sum_x3 / n,
+      quad_form = (m1^2 * adj11 + m2^2 * adj22 + m3^2 * adj33 +
+                   2 * m1 * m2 * adj12 + 2 * m1 * m3 * adj13 + 2 * m2 * m3 * adj23) / det,
+      t_alpha = alpha / sqrt(sigma2 * (1 / n + quad_form))
+    )
+
+  bind_rows(
+    estimates %>% transmute(permno, date, coefficient = "alpha",      estimate = alpha,    t_statistic = t_alpha),
+    estimates %>% transmute(permno, date, coefficient = "mkt_excess", estimate = beta_mkt, t_statistic = t_mkt),
+    estimates %>% transmute(permno, date, coefficient = "smb",        estimate = beta_smb, t_statistic = t_smb),
+    estimates %>% transmute(permno, date, coefficient = "hml",        estimate = beta_hml, t_statistic = t_hml)
+  ) %>%
+    arrange(permno, date, coefficient) %>%
+    as_tibble()
+}
+```
+
+```{r}
+ff3_betas <- roll_ff3_estimation(ff3_betas_data)
+ff3_betas
+```
+
+- Write it
+
+```{r}
+write_parquet(ff3_betas, "data-r/ff3_betas.parquet")
+```
+
+### 4) Expected Returns (for event study)
+
+![](images/clipboard-3324582666.png)
+
+```{r}
+# keep only the three betas (drop alphas), reshape wide
+ff3_betas_wide <- read_parquet("data-r/ff3_betas.parquet") %>%
+  filter(coefficient != "alpha") %>%
+  select(permno, date, coefficient, estimate) %>%
+  pivot_wider(names_from = coefficient, values_from = estimate, names_prefix = "beta_") %>%
+  rename(beta_mkt = beta_mkt_excess) # cleaner name
+
+# Get risk-free factor realizations from FF3 database
+
+ff3 <- read_parquet("data-r/factors_ff3_monthly.parquet") %>%
+  select(date, risk_free, mkt_excess, smb, hml)
+```
+
+```{r}
+expected_returns_ff3 <- ff3_betas_wide %>%
+  mutate(date = date %m+% months(1)) %>% # lag betas: month t's E[r] uses betas estimated through t-1 (no look-ahead)
+  left_join(ff3, join_by(date)) %>%
+  mutate(
+    exp_ret = risk_free +
+      beta_mkt * mkt_excess +
+      beta_smb * smb +
+      beta_hml * hml # E[r] = rf + b1(rm-rf) + b2·SMB + b3·HML
+  ) %>%
+  select(permno, date, exp_ret)
+```
+
+### 5) Abnormal Returns
+
+```{r}
+
+```
+
+![](images/clipboard-2500618781.png)
+
+```{r}
+ff3_abnormal_returns <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>%
+  select(permno, date, ret) %>%
+  inner_join(expected_returns_ff3, join_by(permno, date)) %>%
+  mutate(ar = ret - exp_ret) # abnormal return = actual - expected
+```
+
+For Cumulative Abnormal Returns (CARs) - just `ar` summed over your event window per firm. Usually used over Daily Stock Price (use Eventus - <https://wrds-www.wharton.upenn.edu/pages/get-data/eventus/>)
+
+CAR formula (abnormal returns summed over the event window from t₁ to t₂):
+
+![](images/clipboard-2249727796.png)
+
+## G) Fama-MacBeth Regressions (here using FF3)
+
+**Fama-MacBeth is a general econometric procedure, not a specific asset pricing model.** It's the *testing machinery*, and CAPM/FF3/FF5/q5 are the *models being tested*. You can plug any of them (or your own custom factors/characteristics) into the same two-step framework.
+
+Researchers use the two-stage regression approach to estimate risk premiums in various markets, but predominately in the stock market.
+
+### 1) Libraries Data Preparation
+
+```{r}
+library(sandwich) # robust covariance matrix estimators
+library(broom) # converts lm()'s output into a clean little table of coefficient 
+```
+
+We illustrate Fama and MacBeth ([1973](https://www.tidy-finance.org/chapters/fama-macbeth-regressions.html#ref-Fama1973)) with the monthly CRSP sample and use three characteristics to explain the cross-section of returns: market capitalization, the book-to-market ratio, and the CAPM beta.
+
+```{r}
+crsp_monthly_fama_macbeth <- read_parquet("data-r/crsp_monthly_gvkey.parquet") %>% 
+  select(permno, gvkey, date, ret_excess, mktcap) %>% 
+  collect()
+
+compustat_fama_macbeth <- read_parquet("data-r/compustat_annual.parquet") %>% 
+  select(datadate, gvkey, be) %>% 
+  filter(be > 0)
+
+betas_fama_macbeth <- read_parquet("data-r/capm_monthly.parquet") %>%
+  filter(coefficient == "mkt_excess") %>%
+  select(permno, date, beta = estimate)
+```
+
+- **Compute** the **book-to-market ratio** and the (log) **market capitalization and create** the Fama-Mcbeth **dataset**
+
+```{r}
+characteristics <- compustat_fama_macbeth %>% 
+  mutate(date = floor_date(ymd(datadate), "month")) %>% 
+  left_join(crsp_monthly_fama_macbeth, join_by(gvkey, date)) %>% 
+  left_join(betas_fama_macbeth, join_by(permno, date)) %>% 
+  transmute(
+    gvkey,
+    bm = be / mktcap,
+    log_mktcap = log(mktcap),
+    beta = beta,
+    sorting_date = date %m+% months(6)
+  )
+
+data_fama_macbeth <- crsp_monthly_fama_macbeth %>% 
+  left_join(characteristics, join_by(gvkey, date == sorting_date)) %>% 
+  group_by(permno) %>% 
+  arrange(date) %>% 
+  fill(c(beta, bm, log_mktcap), .direction = "down") %>% 
+  ungroup() %>% 
+  left_join(
+    crsp_monthly_fama_macbeth %>% 
+      select(permno, date, ret_excess_lead = ret_excess) %>% 
+      mutate(date = date %m-% months(1)),
+    join_by(permno, date)
+  ) %>% 
+  select(permno, date, ret_excess_lead, beta, log_mktcap, bm) %>% 
+  drop_na()
+```
+
+### 2) Cross-Sectional Regression (estimate γ\*\* for each characteristic\*\*)
+
+First, we run the cross-sectional regressions with the characteristics as explanatory variables for each month. We regress the returns of the test assets at a particular time point on the characteristics of each asset. By doing so, **we get an ESTIMATE of the risk premiums γ** for each point in time.
+
+![](images/clipboard-2811317808.png)
+
+```{r}
+risk_premiums <- data_fama_macbeth %>% 
+  nest(data = c(ret_excess_lead, beta, log_mktcap, bm, permno)) %>% # create mini table per month for easier lm()
+  mutate(
+    estimates = map( # run one regression across its stocks for each mini table to find γ of beta, log_mktcap and bm
+      data,
+      \(x) tidy(lm(ret_excess_lead ~ beta + log_mktcap + bm, data = x)) # tidy() (from broom) just converts lm()'s output into a clean little table of coefficient 
+    )
+  ) %>% 
+  unnest(estimates) # Stacks all those monthly coefficient tables back into one long table
+```
+
+### 3) Time-series Aggregation (expected **γ** for each characteristic)
+
+Now that we have the risk premiums’ estimates for each period, we can average across the time-series dimension to get the expected risk premium for each characteristic.
+
+```{r}
+price_of_risk <- risk_premiums %>% 
+  group_by(factor = term) %>% 
+  summarize(
+    risk_premium = mean(estimate),
+    t_statistic = mean(estimate) / sd(estimate) * sqrt(n())
+  )
+```
+
+### 4) Adjust for autocorrelation
+
+It is common to adjust for autocorrelation when reporting standard errors of risk premiums. As in [Univariate Portfolio Sorts](https://www.tidy-finance.org/chapters/univariate-portfolio-sorts.html), the typical procedure for this is computing Newey and West ([1987](https://www.tidy-finance.org/chapters/fama-macbeth-regressions.html#ref-Newey1987)) standard errors.
+
+We again recommend the data-driven approach of Newey and West ([1994](https://www.tidy-finance.org/chapters/fama-macbeth-regressions.html#ref-Newey1994)) using the `NeweyWest()` function, but note that you can enforce the typical 6 lag settings via `NeweyWest(., lag = 6, prewhite = FALSE)`.
+
+```{r}
+regressions_for_newey_west <- risk_premiums %>% 
+  select(date, factor = term, estimate) %>% 
+  nest(data = c(date, estimate)) %>% 
+  mutate(
+    model = map(data, \(x) lm(estimate ~ 1, x)),
+    mean = map(model, tidy)
+  )
+
+price_of_risk_newey_west <- regressions_for_newey_west %>% 
+  mutate(newey_west_se = map_dbl(model, \(x) sqrt(NeweyWest(x)))) %>% 
+  unnest(mean) %>% 
+  mutate(t_statistic_newey_west = estimate / newey_west_se) %>% 
+  select(factor, risk_premium = estimate, t_statistic_newey_west)
+
+left_join(
+  price_of_risk,
+  price_of_risk_newey_west %>% 
+    select(factor, t_statistic_newey_west),
+  join_by(factor)
+)
+```
