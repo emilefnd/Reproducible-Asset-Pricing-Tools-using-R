@@ -1,6 +1,6 @@
 # Reproducible Asset Pricing Tools using R
 
-Python reproduction of the **Financial Data** and **Asset Pricing** chapters of [Tidy Finance](https://www.tidy-finance.org/chapters/). I wrote the manual, step-by-step version of each task. The book also offers automated shortcuts through its R package.
+Python reproduction of the **Financial Data** and **Asset Pricing** chapters of [Tidy Finance](https://www.tidy-finance.org/chapters/). I wrote the manual, step-by-step version of each (most) task. The book also offers automated shortcuts through its R package.
 
 ## Goal
 
